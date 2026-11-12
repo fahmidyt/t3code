@@ -101,7 +101,7 @@ checkpoints, PR linking, browser tools, pending requests
 
 - Exactly one `Start` with exactly one outbound edge (unlabeled) to the first real node
 - No dangling edges; all endpoint ids exist
-- `Branch`: exactly two outbound edges with keys `then` and `else` (or configured true/false keys)
+- `Branch`: exactly two outbound edges with keys `then` and `else` only
 - `Parallel`: ≥ 1 outbound edge from the Parallel **fork** handle to `Agent` nodes; each of those Agents has exactly one success outbound edge that returns to this Parallel’s **join** handle (Transform-only nodes may sit on that return path; no other Agent may); the Parallel node also has exactly one outbound edge from handle **`next`** taken only after join succeeds
 - Cycles: a back-edge (edge whose target can reach its source via existing directed edges) is legal only if it is the `then` or `else` edge of a `Branch` that sets `maxLoopIterations`, or it is reachable only through such a Branch edge; otherwise reject
 - Unreachable nodes → warning on save, **error** on StartRun
@@ -135,8 +135,10 @@ Defaults: `Agent` / critical path → `fail-run`.
 
 - `fail-run` — fail attempt → fail run; if the attempt is a Parallel fork worker, cancel sibling fork attempts first
 - `retry` — retry up to `maxAttempts` with `backoffMs`; when exhausted, apply `retryExhausted` (`fail-run` or open HumanGate `error`)
-- `gate` — open HumanGate `error` with actions `retry` | `skip` | `abort` (see HumanGate)
+- `gate` — open HumanGate `error` (actions depend on whether the node is a Parallel fork worker — see HumanGate matrix)
 - `skip` — mark attempt `skipped` and continue along the node’s **primary outbound success edge** as if succeeded, writing `context.skips[<nodeId>] = true`. Not allowed on `Start`, `Parallel`, or any Agent that is a Parallel fork worker (validation error). Use `skip` for optional linear steps (e.g. browser QA Agent when tools unavailable via adapter mapping to skip).
+
+**Parallel node `onError`:** ignored / invalid on save — worker failure always cancels siblings + fail-run. Fork worker Agents may use `fail-run`, `retry` (with `retryExhausted: "fail-run" | "gate"`), or `gate`, but never `skip`.
 
 ### Agent config
 
@@ -185,10 +187,10 @@ fields: Array<{
   required: boolean
   writeTo: string             // dot-path under context where submit writes the value
 }>
-timeout: { mode: "forever" } | { mode: "fail-run"; timeoutMs: number } | { mode: "remind"; everyMs: number }
+timeout: { mode: "forever" } | { mode: "fail-run"; timeoutMs: number }
 ```
 
-System-opened gates (`error`, `branch_repair`, `wait_manual`) use engine-generated title/body/fields; `wait_manual` has zero fields.
+System-opened gates (`error`, `branch_repair`, `structured_output_repair`, `wait_manual`) use engine-generated title/body/fields; `wait_manual` has zero fields.
 
 ### HumanGate (unified resolve model)
 
@@ -196,16 +198,18 @@ Gate payload always includes: `gateId`, `runId`, `nodeId`, `attempt`, `kind`, `t
 
 **Kinds → allowed actions (closed matrix):**
 
-| Kind            | When                                          | Actions                             | Effect                                                                                                                       |
-| --------------- | --------------------------------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `input`         | HumanGate node on hero/context path           | `submit`, `abort`                   | `submit` merges `fieldValues` into context at configured paths and continues success edge; `abort` → fail run `gate_aborted` |
-| `error`         | `onError: "gate"` or `retryExhausted: "gate"` | `retry`, `skip`, `abort`            | `retry` restarts the failed attempt; `skip` same as node `onError: "skip"`; `abort` → fail run                               |
-| `branch_repair` | Branch predicate path missing/wrong type      | `force_then`, `force_else`, `abort` | Take the chosen Branch edge without re-evaluating; `abort` → fail run                                                        |
-| `wait_manual`   | Wait node `mode: "manual"`                    | `submit`, `abort`                   | `submit` completes the Wait attempt successfully; `abort` → fail run                                                         |
+| Kind                       | When                                                                       | Actions                             | Effect                                                                                                                                         |
+| -------------------------- | -------------------------------------------------------------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `input`                    | HumanGate node on hero/context path                                        | `submit`, `abort`                   | `submit` merges each field’s value into `context` at that field’s `writeTo` path and continues success edge; `abort` → fail run `gate_aborted` |
+| `error`                    | `onError: "gate"` / `retryExhausted: "gate"` on a **non-fork-worker** node | `retry`, `skip`, `abort`            | `retry` restarts the failed attempt; `skip` applies node `onError: "skip"` semantics; `abort` → fail run                                       |
+| `error` (fork worker)      | same, but node is a Parallel fork worker Agent                             | `retry`, `abort` only               | No `skip` (would break Parallel join). `abort` or exhausted failure cancels siblings + fail-run                                                |
+| `branch_repair`            | Branch predicate path missing/wrong type                                   | `force_then`, `force_else`, `abort` | Take the chosen Branch edge without re-evaluating; `abort` → fail run                                                                          |
+| `structured_output_repair` | Agent structured output missing/invalid                                    | `retry`, `abort`                    | `retry` re-runs the Agent attempt; `abort` → fail run. No force-continue of bad output in v1                                                   |
+| `wait_manual`              | Wait node `mode: "manual"`                                                 | `submit`, `abort`                   | `submit` completes the Wait attempt successfully; `abort` → fail run                                                                           |
 
 No other actions exist in v1. UI only shows the actions listed for the gate’s kind.
 
-**Timeout:** uses the HumanGate node’s `timeout` config for kind `input`; system gates default to `forever`.
+**Timeout:** uses the HumanGate node’s `timeout` config for kind `input` (`forever` or `fail-run` → emit `GateTimedOut` then fail run). System gates default to `forever`. No `remind` mode in v1.
 
 `resolveGate` RPC body: `{ gateId, action, fieldValues? }`. Action must be in the kind’s set; empty required fields on `submit` → RPC validation error (engine not resumed). Concurrent resolve → conflict.
 
@@ -235,6 +239,8 @@ No other actions exist in v1. UI only shows the actions listed for the gate’s 
 ### WorkflowEdge
 
 - `id`, `from`, `to`, `fromHandle?`, `toHandle?`, `key?` (`then` | `else` | unlabeled)
+- Parallel canonical handles: `fromHandle`/`toHandle` values `fork` | `join` | `next` as described under Parallel
+- `StartRun` `idempotencyKey` is scoped per `workflowId` (same key on another workflow is unrelated)
 
 ### WorkflowRun
 
@@ -346,7 +352,7 @@ One worker fails → cancel siblings + fail the run.
 - Provider/model unavailable: clear failure; no silent fallback
 - Client auth lost: run continues; any paired operate-scoped session can `resolveGate`
 - Environment offline: `waiting_environment`; resume on reconnect
-- Invalid structured output / predicate path: HumanGate (force/abort), not silent else
+- Invalid structured output: HumanGate `structured_output_repair` (`retry`/`abort`); invalid Branch predicate path: `branch_repair`
 - Loop re-entrancy: new attempt; context accumulates; prior outputs versioned under attempts
 - QA browser unavailable: node `onError: "skip"` or `"gate"`; never fake evidence; PR prompt must only cite `context.artifacts.evidence`
 - PR exists / push rejected: Agent failure → node `onError` (recommend `gate`)
