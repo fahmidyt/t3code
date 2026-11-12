@@ -37,7 +37,7 @@ Task-delegate pipeline (all steps use the v1 node types below):
 2. **Agent** (“Brainstorm”) checks the task and writes `plan` + boolean `needsContext` into context via a declared structured output mapping.
 3. **Branch** on `context.needsContext`: if true → **HumanGate** → edge **back to Brainstorm Agent** (new attempt); else continue.
 4. **Parallel** fan-out along outbound edges to worker **Agent** nodes (cheaper models); join when all succeed.
-5. **Branch** web vs not: web path runs **Agent** (“QA”) with browser tools; non-web skips browser. Evidence is recorded as **run artifacts** from tool results (never faked). **Transform** maps an evidence index into the PR prompt context.
+5. **Branch** web vs not: web path runs **Agent** (“QA”) with browser tools (`onError: "skip"` if browser unavailable); non-web takes else and skips that Agent. Evidence artifacts update `context.artifacts.evidence` via the engine. **Transform** maps `artifacts.evidence` into the PR prompt context.
 6. **Agent** (“PR”) opens a PR that includes/links the evidence index.
 
 **Loop safety:** On a Branch that can return to an earlier node, `maxLoopIterations` defaults to **3** (configurable on that Branch, integer ≥ 1). Exceeding the cap → fail-run with reason `loop_cap_exceeded` (optional final HumanGate can be wired explicitly if desired).
@@ -81,7 +81,8 @@ checkpoints, PR linking, browser tools, pending requests
 - Definition rows: current graph + monotonic `version`. Saving bumps `version`. Concurrent save: optimistic concurrency on `version`; loser retries/rebases in UI.
 - Snapshot at `StartRun`: deep-copy graph JSON into the run row (size soft-cap; reject start if snapshot exceeds cap — default 1 MiB encoded).
 - Context bag soft-cap (default 512 KiB encoded); Transform/Agent writes that would exceed → node failure with `context_too_large`.
-- Artifacts: metadata + paths/URLs in DB; large blobs on disk under userdata with per-run directory; evidence index in context stays compact.
+- Artifacts: metadata + paths/URLs in DB; large blobs on disk under userdata with per-run directory.
+- **Evidence context contract:** whenever an `ArtifactAdded` event is committed, the engine patches `context.artifacts.items` (array of `{ id, kind, title, hrefOrPath, producedByAttempt }`) and rebuilds `context.artifacts.evidence` as that array filtered to QA/evidence kinds. Hero Transform reads `from: "artifacts.evidence"` — adapters do not write that path themselves.
 
 ### Subscription model
 
@@ -100,8 +101,8 @@ checkpoints, PR linking, browser tools, pending requests
 - Exactly one `Start`
 - No dangling edges; all endpoint ids exist
 - `Branch`: exactly two outbound edges with keys `then` and `else` (or configured true/false keys)
-- `Parallel`: ≥ 1 outbound edge to `Agent` nodes; every such Agent has a path to a common **join point** (inbound edge back to the same Parallel node’s join port, or a dedicated edge target listed as `joinNodeId` on the Parallel config — v1 uses **join on the Parallel node**: workers’ success edges return to the Parallel’s `join` handle)
-- Cycles allowed only if every back-edge targets a node dominated by a Branch with `maxLoopIterations`
+- `Parallel`: ≥ 1 outbound edge from the Parallel **fork** handle to `Agent` nodes; each of those Agents has exactly one success outbound edge that returns to this Parallel’s **join** handle (Transform-only nodes may sit on that return path; no other Agent may)
+- Cycles: a back-edge (edge whose target can reach its source via existing directed edges) is legal only if it is the `then` or `else` edge of a `Branch` that sets `maxLoopIterations`, or it is reachable only through such a Branch edge; otherwise reject
 - Unreachable nodes → warning on save, **error** on StartRun
 - Parallel worktree collision: two worker Agents under the same Parallel with identical resolved worktree identity → error (see worktree strategies)
 
@@ -122,11 +123,19 @@ Hero labels like Brainstorm / QA / PR are **titles** on `Agent` nodes, not separ
 Each node also carries:
 
 ```
-onError: "fail-run" | "retry" | "gate" | "skip-branch"
-retry?: { maxAttempts: number; backoffMs: number }  // when onError includes retry behavior
+onError: "fail-run" | "retry" | "gate" | "skip"
+retry?: { maxAttempts: number; backoffMs: number }  // required when onError is "retry"
+retryExhausted?: "fail-run" | "gate"               // required when onError is "retry"; default "fail-run"
 ```
 
-Defaults: `Agent` / critical path → `fail-run`; optional QA browser path may use `skip-branch`.
+Defaults: `Agent` / critical path → `fail-run`.
+
+**`onError` semantics:**
+
+- `fail-run` — fail attempt → fail run; if the attempt is a Parallel fork worker, cancel sibling fork attempts first
+- `retry` — retry up to `maxAttempts` with `backoffMs`; when exhausted, apply `retryExhausted` (`fail-run` or open HumanGate `error`)
+- `gate` — open HumanGate `error` with actions `retry` | `skip` | `abort` (see HumanGate)
+- `skip` — mark attempt `skipped` and continue along the node’s **primary outbound success edge** as if succeeded, writing `context.skips[<nodeId>] = true`. Not allowed on `Start`, `Parallel`, or any Agent that is a Parallel fork worker (validation error). Use `skip` for optional linear steps (e.g. browser QA Agent when tools unavailable via adapter mapping to skip).
 
 ### Agent config
 
@@ -165,28 +174,37 @@ Defaults: `Agent` / critical path → `fail-run`; optional QA browser path may u
 
 Gate payload always includes: `gateId`, `runId`, `nodeId`, `attempt`, `kind`, `title`, `body`, `fields[]`, `actions[]`.
 
-**Kinds:**
+**Kinds → allowed actions (closed matrix):**
 
-- `input` — ask for context (hero path)
-- `error` — opened because `onError: "gate"` or invalid branch output
-- `wait_manual` — companion to Wait `manual`
+| Kind            | When                                          | Actions                             | Effect                                                                                                                       |
+| --------------- | --------------------------------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `input`         | HumanGate node on hero/context path           | `submit`, `abort`                   | `submit` merges `fieldValues` into context at configured paths and continues success edge; `abort` → fail run `gate_aborted` |
+| `error`         | `onError: "gate"` or `retryExhausted: "gate"` | `retry`, `skip`, `abort`            | `retry` restarts the failed attempt; `skip` same as node `onError: "skip"`; `abort` → fail run                               |
+| `branch_repair` | Branch predicate path missing/wrong type      | `force_then`, `force_else`, `abort` | Take the chosen Branch edge without re-evaluating; `abort` → fail run                                                        |
+| `wait_manual`   | Wait node `mode: "manual"`                    | `submit`, `abort`                   | `submit` completes the Wait attempt successfully; `abort` → fail run                                                         |
 
-**Actions (enum):** `approve` | `reject` | `submit` | `retry` | `skip` | `abort` | `force_then` | `force_else`
+No other actions exist in v1. UI only shows the actions listed for the gate’s kind.
 
-Allowed actions depend on kind (e.g. `input` → `submit`/`abort`; `error` → `retry`/`skip`/`abort`; invalid branch → `force_then`/`force_else`/`abort`).
-
-**Reject** on `input`: abort run (unless an explicit Branch edge is configured for reject — v1 default abort).  
 **Timeout:** `forever` (default) | `fail-run` after `timeoutMs` | `remind` (notification only, still waiting).
 
-`resolveGate` RPC body: `{ gateId, action, fieldValues? }`. Empty required fields → RPC validation error (engine not resumed). Concurrent resolve → conflict.
+`resolveGate` RPC body: `{ gateId, action, fieldValues? }`. Action must be in the kind’s set; empty required fields on `submit` → RPC validation error (engine not resumed). Concurrent resolve → conflict.
+
+**DeleteWorkflow / edit while running:** `DeleteWorkflow` rejected if any non-terminal run exists for that workflow. Editing the definition is allowed (bumps `version`) and does not affect in-flight runs.
 
 ### Parallel (graph shape)
 
 - Parallel is a **canvas node** with:
   - `fork` handle: outbound edges to worker `Agent` nodes
   - `join` handle: each worker’s success path must edge back to this Parallel’s join (directly or via Transform-only nodes; no other Agent between worker and join in v1)
+- No alternate `joinNodeId` shape in v1.
 - Engine activates all fork targets; join completes when every forked Agent attempt succeeded; one failure → cancel other forked attempts + fail-run
 - Workers are normal graph nodes (not nested JSON-only children)
+
+### Start / coordinator lifecycle
+
+- `StartRun` creates the run, pins the snapshot, seeds context from input, and creates attempt 0 on the `Start` node which immediately succeeds (no provider call).
+- Optionally creates a **coordinator thread** (`coordinatorThreadId`) for the run when any Agent uses `threadMode: "delegateUnderRun"`; otherwise threads are created per Agent attempt as needed.
+- After Start succeeds, the engine follows the single outbound edge to the next node (Brainstorm Agent in the hero graph).
 
 ### Wait (narrowed)
 
@@ -296,10 +314,7 @@ I/O only for effects above. **Artifacts are not a node type**; Agent tool result
 
 ### Per-node `onError`
 
-- **fail-run:** mark attempt failed → run failed → cancel in-flight Parallel siblings
-- **retry:** use `retry` config; then fall through to fail-run or gate if still failing
-- **gate:** open HumanGate `error` with `retry` | `skip` | `abort`
-- **skip-branch:** mark attempt `skipped`; Branch/Parallel treats as the skip path where configured
+- **fail-run / retry / gate / skip:** see Domain model `onError` semantics (single source of truth)
 
 ### Parallel failure (locked)
 
@@ -313,7 +328,7 @@ One worker fails → cancel siblings + fail the run.
 - Environment offline: `waiting_environment`; resume on reconnect
 - Invalid structured output / predicate path: HumanGate (force/abort), not silent else
 - Loop re-entrancy: new attempt; context accumulates; prior outputs versioned under attempts
-- QA browser unavailable: `skip-branch` or `gate`; never fake evidence; PR prompt must only cite recorded artifacts
+- QA browser unavailable: node `onError: "skip"` or `"gate"`; never fake evidence; PR prompt must only cite `context.artifacts.evidence`
 - PR exists / push rejected: Agent failure → node `onError` (recommend `gate`)
 - Double Run: `idempotencyKey` on start; UI disables while a non-terminal run exists for that key
 - Permission denied: prefer `onError: gate`
