@@ -3,7 +3,7 @@
 **Date:** 2026-11-12  
 **Status:** Approved  
 **Product home:** Inside T3 Code (new UI surface)  
-**Delivery:** Big-bang v1 (all listed node types production-ready before ship)
+**Delivery:** Big-bang product ship (all v1 node types ready before user-facing release). Implementation work is still sequenced by subsystem in the plan (contracts → engine → adapters → web → mobile gates).
 
 ## Problem
 
@@ -20,24 +20,27 @@ T3 Code already runs agents, delegates, human pauses, PR linking, and browser to
 ## Non-goals (v1)
 
 - Classic automation builder / integration marketplace.
+- Cron / webhook / HTTP automation triggers (including Wait-on-schedule).
 - Mobile canvas editing (mobile: list runs + resolve human gates only).
 - Rewriting an in-flight run when the definition is edited.
 - Silent model fallback when a configured provider/model is unavailable.
 - Claiming QA passed when browser/evidence tools were unavailable.
 - Mid-run plan rewrite without cancel + new run.
+- Special node types named Brainstorm / QA / PR — those are configured **Agent** nodes (+ Branch / Transform as needed).
+- MCP exposure of workflow RPCs in v1 (client WS RPC only; MCP can follow later).
 
 ## Hero workflow (acceptance story)
 
-Task-delegate pipeline:
+Task-delegate pipeline (all steps use the v1 node types below):
 
-1. Human starts a run with a task brief (attachments optional).
-2. **Brainstorm** agent checks the task and produces a plan + `needsContext`.
-3. **Branch:** if more context needed → **HumanGate** → **loop back to Brainstorm**; else continue.
-4. **Parallel** fan-out of worker **Agent** steps on cheaper models; join when all succeed.
-5. **QA** agents produce evidence; if web → real browser evidence; else skip browser path via Branch (never fake evidence).
-6. **PR** agent opens a PR that includes/links the evidence.
+1. Human starts a run with a task brief (attachments optional) via **Start**.
+2. **Agent** (“Brainstorm”) checks the task and writes `plan` + boolean `needsContext` into context via a declared structured output mapping.
+3. **Branch** on `context.needsContext`: if true → **HumanGate** → edge **back to Brainstorm Agent** (new attempt); else continue.
+4. **Parallel** fan-out along outbound edges to worker **Agent** nodes (cheaper models); join when all succeed.
+5. **Branch** web vs not: web path runs **Agent** (“QA”) with browser tools; non-web skips browser. Evidence is recorded as **run artifacts** from tool results (never faked). **Transform** maps an evidence index into the PR prompt context.
+6. **Agent** (“PR”) opens a PR that includes/links the evidence index.
 
-Loop safety: Brainstorm ↔ HumanGate edges have a configurable max-iteration cap.
+**Loop safety:** On a Branch that can return to an earlier node, `maxLoopIterations` defaults to **3** (configurable on that Branch, integer ≥ 1). Exceeding the cap → fail-run with reason `loop_cap_exceeded` (optional final HumanGate can be wired explicitly if desired).
 
 ## Approach
 
@@ -54,10 +57,10 @@ Rejected alternatives:
 Web/Desktop canvas + inspector
 Mobile: runs + gate resolve
         ↓ typed WS / contracts
-Workflow + WorkflowRun schemas, RPCs, projections
-        ↓ commands → events
-WorkflowEngine (pure decide; effects only)
-        ↓
+Workflow schemas, RPCs, run projections
+        ↓ commands → events (+ outbox effects)
+WorkflowEngine (pure decide)
+        ↓ effect worker / node adapters
 Existing runtime: threads/turns/providers, delegates,
 checkpoints, PR linking, browser tools, pending requests
 ```
@@ -68,147 +71,282 @@ checkpoints, PR linking, browser tools, pending requests
 - A **WorkflowRun** pins a **definition snapshot** at start; definition edits do not mutate in-flight runs.
 - Progress of a run is authoritative on the run projection, not on chat UI state.
 - Node execution may spawn or bind threads/turns; those are linked from node attempts.
-- Automation node types are out of v1 but the engine/schema should not hard-block a later type registry.
+- Exactly **one** `Start` node per graph.
+- Node-type registry is extensible later; v1 ships a fixed set.
+
+### Persistence
+
+- Store workflow definitions and run projections in the environment userdata SQLite (`statev2` family), same home rules as other project artifacts — **not** the developer’s live `~/.t3` from a worktree by accident.
+- **Event-sourced runs:** append-only `WorkflowRunEvent` log per run; projections (status, context, attempts, artifacts, active gates) rebuilt/updated in the same commit transaction as events + outbox effects (mirrors orchestration sink pattern).
+- Definition rows: current graph + monotonic `version`. Saving bumps `version`. Concurrent save: optimistic concurrency on `version`; loser retries/rebases in UI.
+- Snapshot at `StartRun`: deep-copy graph JSON into the run row (size soft-cap; reject start if snapshot exceeds cap — default 1 MiB encoded).
+- Context bag soft-cap (default 512 KiB encoded); Transform/Agent writes that would exceed → node failure with `context_too_large`.
+- Artifacts: metadata + paths/URLs in DB; large blobs on disk under userdata with per-run directory; evidence index in context stays compact.
+
+### Subscription model
+
+- `workflows.subscribe` / `workflowRuns.subscribe` (project-scoped) push projection updates over existing WS subscription patterns (same family as scheduled tasks / orchestration projections).
 
 ## Domain model
 
 ### Workflow
 
 - `workflowId`, `projectId`, `title`, `createdAt`, `updatedAt`, `version`
-- `graph`: nodes[], edges[], viewport/layout metadata
-- Validation on save and on `StartRun`
+- `graph`: `{ nodes, edges, layout }`
+- Validated on save and on `StartRun`
+
+### Graph validation (reject save / start)
+
+- Exactly one `Start`
+- No dangling edges; all endpoint ids exist
+- `Branch`: exactly two outbound edges with keys `then` and `else` (or configured true/false keys)
+- `Parallel`: ≥ 1 outbound edge to `Agent` nodes; every such Agent has a path to a common **join point** (inbound edge back to the same Parallel node’s join port, or a dedicated edge target listed as `joinNodeId` on the Parallel config — v1 uses **join on the Parallel node**: workers’ success edges return to the Parallel’s `join` handle)
+- Cycles allowed only if every back-edge targets a node dominated by a Branch with `maxLoopIterations`
+- Unreachable nodes → warning on save, **error** on StartRun
+- Parallel worktree collision: two worker Agents under the same Parallel with identical resolved worktree identity → error (see worktree strategies)
 
 ### WorkflowNode (v1 types)
 
-| Type        | Purpose              | Key config                                                                                             |
-| ----------- | -------------------- | ------------------------------------------------------------------------------------------------------ |
-| `Start`     | Run input            | Task brief + attachment refs seed context                                                              |
-| `Agent`     | Provider turn        | Provider, model, prompt template (from context), worktree strategy, fresh thread vs delegate under run |
-| `HumanGate` | Pause for human      | Prompt/fields schema, timeout policy, resolve actions                                                  |
-| `Branch`    | Conditional edge     | Expression / structured field (e.g. `needsContext`), loop cap when edge returns to prior node          |
-| `Parallel`  | Fan-out + join       | Child agent node refs; v1 join = all must succeed                                                      |
-| `Wait`      | External/manual wait | PR checks, schedule, manual resume                                                                     |
-| `Transform` | Context mapping      | Map/reshape fields between steps / into prompts                                                        |
+Hero labels like Brainstorm / QA / PR are **titles** on `Agent` nodes, not separate types.
+
+| Type        | Purpose               | Key config                                                                                                      |
+| ----------- | --------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `Start`     | Run input             | Seeds `context.task` (string) + `context.attachments` (ids)                                                     |
+| `Agent`     | Provider turn         | See Agent config below                                                                                          |
+| `HumanGate` | Pause for human       | See HumanGate below                                                                                             |
+| `Branch`    | Conditional edge      | See Branch below                                                                                                |
+| `Parallel`  | Fan-out + join        | Outbound edges to Agent workers; join when all succeed; on one failure cancel siblings + fail-run               |
+| `Wait`      | Block until condition | **v1:** `manual` resume **or** `pullRequestChecks` (thread/PR already linked in context). **No schedule/cron.** |
+| `Transform` | Context mapping       | See Transform below                                                                                             |
+
+Each node also carries:
+
+```
+onError: "fail-run" | "retry" | "gate" | "skip-branch"
+retry?: { maxAttempts: number; backoffMs: number }  // when onError includes retry behavior
+```
+
+Defaults: `Agent` / critical path → `fail-run`; optional QA browser path may use `skip-branch`.
+
+### Agent config
+
+- `provider`, `model` (required; unavailable → fail per policy, no silent fallback)
+- `promptTemplate`: string with `{{path.to.field}}` substitutions from context (missing path → empty string; use Transform to require fields earlier)
+- `structuredOutput?: { fields: Record<string, "string" | "boolean" | "number">; writeTo: string }`  
+  Example Brainstorm: fields `{ needsContext: "boolean", plan: "string" }` writeTo `context` root (or `context.brainstorm`)
+- `threadMode`: `"newThread"` | `"delegateUnderRun"` (run has a coordinator thread id)
+- `worktree`:
+  - `"project"` — project root (default)
+  - `"new"` — fresh worktree per attempt
+  - `"key:<string>"` — shared named worktree among nodes with the same key  
+    Collision rule: under one Parallel, two children may not both use `"project"` or the same `key:` string.
+
+### Branch
+
+- `predicate`: **only** path predicates, not a general language:
+  - `{ type: "pathTruthy", path: "needsContext" }`
+  - `{ type: "pathEquals", path: "kind", value: "web" }`
+  - `{ type: "pathExists", path: "pr.url" }`
+- Paths are dot-paths into the run `context` object.
+- Outbound edges: `then` (predicate true), `else` (false).
+- If the path is missing / wrong type for the predicate → **do not take else silently**; open a system HumanGate with actions `force_then` | `force_else` | `abort` (and optional “send back to previous Agent” if an edge exists).
+- `maxLoopIterations` when any outbound path can reach a prior node (default 3).
+
+### Transform
+
+- Ordered list of mapping ops (no scripts in v1):
+  - `{ op: "set", to: "pr.evidenceIndex", from: "artifacts.evidence" }`
+  - `{ op: "setLiteral", to: "qa.mode", value: "browser" }`
+  - `{ op: "pick", to: "summary", from: "brainstorm", keys: ["plan"] }`
+- Missing `from` → node fails with `transform_missing_path` unless `optional: true` on that op.
+- No loops/conditionals inside Transform (use Branch nodes).
+
+### HumanGate (unified resolve model)
+
+Gate payload always includes: `gateId`, `runId`, `nodeId`, `attempt`, `kind`, `title`, `body`, `fields[]`, `actions[]`.
+
+**Kinds:**
+
+- `input` — ask for context (hero path)
+- `error` — opened because `onError: "gate"` or invalid branch output
+- `wait_manual` — companion to Wait `manual`
+
+**Actions (enum):** `approve` | `reject` | `submit` | `retry` | `skip` | `abort` | `force_then` | `force_else`
+
+Allowed actions depend on kind (e.g. `input` → `submit`/`abort`; `error` → `retry`/`skip`/`abort`; invalid branch → `force_then`/`force_else`/`abort`).
+
+**Reject** on `input`: abort run (unless an explicit Branch edge is configured for reject — v1 default abort).  
+**Timeout:** `forever` (default) | `fail-run` after `timeoutMs` | `remind` (notification only, still waiting).
+
+`resolveGate` RPC body: `{ gateId, action, fieldValues? }`. Empty required fields → RPC validation error (engine not resumed). Concurrent resolve → conflict.
+
+### Parallel (graph shape)
+
+- Parallel is a **canvas node** with:
+  - `fork` handle: outbound edges to worker `Agent` nodes
+  - `join` handle: each worker’s success path must edge back to this Parallel’s join (directly or via Transform-only nodes; no other Agent between worker and join in v1)
+- Engine activates all fork targets; join completes when every forked Agent attempt succeeded; one failure → cancel other forked attempts + fail-run
+- Workers are normal graph nodes (not nested JSON-only children)
+
+### Wait (narrowed)
+
+- `mode: "manual"` → opens `wait_manual` HumanGate
+- `mode: "pullRequestChecks"` → requires `context` path to PR identity; uses existing PR check watching; completes when required checks green (or fails per `onError`)
+- No cron/schedule mode in v1
 
 ### WorkflowEdge
 
-- `from`, `to`, optional `label` / branch key (`then` / `else` / named)
+- `id`, `from`, `to`, `fromHandle?`, `toHandle?`, `key?` (`then` | `else` | unlabeled)
 
 ### WorkflowRun
 
-- `runId`, `workflowId`, pinned `definitionSnapshot`, `status`
-- Shared `context` bag (JSON-compatible, typed paths for known outputs)
-- Per-node **attempts** (re-entrancy on loop creates a new attempt; history preserved; outputs versioned)
-- Linked threads/turns per attempt
-- Artifacts (QA evidence refs, screenshots, logs) with size caps / summaries
-- Active gates, failure reason, timestamps
+- `runId`, `workflowId`, `definitionSnapshot`, `definitionVersion`, `status`
+- `context` (JSON object)
+- `attempts[]`: `{ nodeId, attempt, status, threadId?, turnIds?, outputs?, error?, startedAt, finishedAt? }`
+- `artifacts[]`: `{ id, kind, title, hrefOrPath, thumbHref?, producedByAttempt, bytes? }`
+- `activeGateId?`
+- `failureReason?`
+- Timestamps; linked `coordinatorThreadId?`
 
-### Run context
+### Statuses
 
-- Start seeds `context` from the task brief and attachments.
-- Finished nodes write outputs into context (plan, `needsContext`, human answers, worker results, evidence index, PR URL).
-- Agent prompts are templates over context; Transform reshapes before later nodes.
+- Run: `pending` | `running` | `waiting_gate` | `waiting_environment` | `succeeded` | `failed` | `cancelled`
+- Attempt: `pending` | `running` | `succeeded` | `failed` | `cancelled` | `skipped`
+
+## Commands, events, effects
+
+### Commands (WorkflowService → engine)
+
+- `UpsertWorkflow` / `DeleteWorkflow`
+- `StartRun` `{ workflowId, input, idempotencyKey }`
+- `CancelRun` `{ runId }`
+- `ResolveGate` `{ gateId, action, fieldValues? }`
+- `ResumeAfterEnvironment` (internal, when host reconnects)
+- Completions from adapters: `ReportAgentAttemptFinished` / `Failed`, `ReportWaitFinished` / `Failed`, `ReportArtifact`
+
+### Events (persisted)
+
+- `WorkflowDefined` / `WorkflowDeleted`
+- `RunStarted` (with snapshot)
+- `AttemptStarted` / `AttemptSucceeded` / `AttemptFailed` / `AttemptCancelled` / `AttemptSkipped`
+- `ContextPatched`
+- `ArtifactAdded`
+- `GateOpened` / `GateResolved` / `GateTimedOut`
+- `RunWaitingEnvironment` / `RunResumed`
+- `RunSucceeded` / `RunFailed` / `RunCancelled`
+
+### Effects (outbox → adapters)
+
+- `StartAgentAttempt`
+- `CancelAgentAttempt`
+- `OpenHumanGate`
+- `CloseHumanGate`
+- `StartWaitPullRequestChecks`
+- `CancelWait`
+- `PersistArtifact`
 
 ## Server components
 
 ### WorkflowService
 
-CRUD workflows; `startRun` / `cancelRun`; `resolveGate`; list/subscribe workflows and runs. Thin transport over commands; permissions via existing client-guarded RPC scopes (operate).
+Public API + permission mapping. Methods (WS):
+
+| Method                                                              | Scope                           |
+| ------------------------------------------------------------------- | ------------------------------- |
+| `workflows.list` / `workflows.get` / `workflows.subscribe`          | read (paired session)           |
+| `workflows.upsert` / `workflows.delete`                             | `AuthOrchestrationOperateScope` |
+| `workflowRuns.list` / `workflowRuns.get` / `workflowRuns.subscribe` | read                            |
+| `workflowRuns.start` / `workflowRuns.cancel`                        | `AuthOrchestrationOperateScope` |
+| `workflowRuns.resolveGate`                                          | `AuthOrchestrationOperateScope` |
+
+Add each mutating method to `CLIENT_GUARDED_RPC_SCOPES`.  
+v1: **not** registered on orchestrator MCP.
 
 ### WorkflowEngine
 
-Pure decisioning on graph + run state (same spirit as Orchestrator): given a command or completion event, emit run events + outbox effects. No I/O in the decide step.
+Pure function/module: `(state, command|completion) → { events, effects }`. Wired like Orchestrator: serialize per `runId`, commit events + projection + outbox, then effect worker runs adapters and feeds completions back as commands.
 
-### Node adapters (effect handlers)
+### Node adapters
 
-Per-type handlers that perform I/O through existing services:
-
-- Agent → create/bind thread, send turn with configured provider/model
-- HumanGate → pending request visible on web/desktop/mobile
-- Wait → subscribe/wait for PR checks or timer/manual
-- Branch / Transform / Parallel join → engine-local with context writes
-- Artifacts → store refs for inspector + PR step consumption
+I/O only for effects above. **Artifacts are not a node type**; Agent tool results (screenshots, logs) call `ReportArtifact` / `PersistArtifact`. Transform/Branch/Parallel join are engine-local (no adapter).
 
 ## Client surfaces
 
 ### Web + Desktop (v1)
 
 - Workflow list under a project (alongside threads)
-- Canvas editor (React Flow–style): add/configure nodes, wire edges, validate
-- Run cockpit: same canvas with live node statuses; click node → inspector (config in edit mode; turn/gate/evidence in run mode)
-- Entry: project navigation + command palette where other project artifacts live
+- Canvas editor (React Flow–style / `@xyflow`): add/configure nodes, wire edges, validate
+- Run cockpit: same canvas with live statuses; click node → inspector (edit config vs attempt/gate/evidence)
+- Command palette entry for “Workflows” / “New workflow”
 
 ### Mobile (v1)
 
-- List workflows/runs; open run status; approve/reject/answer HumanGates
+- List workflows/runs; run status; resolve HumanGates with the unified action enum
 - No canvas editor
 
 ## Data flow (hero path)
 
-1. `StartRun` → pin snapshot, seed context, activate Start → Brainstorm
-2. Brainstorm Agent completes → write plan / `needsContext` → Branch
-3. If needs context → HumanGate → on resolve, edge **back to Brainstorm** (new attempt); else → Parallel workers
-4. Parallel join when all workers succeed → QA Branch
-5. QA produces artifacts; Transform maps evidence into PR prompt context
-6. PR Agent completes → PR URL in context → run succeeds
-
-Clients subscribe to the run projection. Mobile `resolveGate` uses the same RPC; engine resumes.
+1. `StartRun` → pin snapshot, seed context, activate Start → Brainstorm Agent
+2. Brainstorm succeeds with structured output → Branch on `needsContext`
+3. true → HumanGate `input` → on `submit`, edge back to Brainstorm (new attempt, loop counter++); false → Parallel workers
+4. Parallel join → Branch web/not → QA Agent and/or skip → artifacts → Transform evidence index
+5. PR Agent → `context.pr.url` → `RunSucceeded`
 
 ## Error handling
 
-### Per-node policies
+### Per-node `onError`
 
-- **fail-run** (default for Agent / QA / PR): mark node failed → run failed → cancel in-flight Parallel siblings
-- **retry**: N attempts with backoff; then fall through to node policy
-- **gate**: open HumanGate with error (retry / skip / abort)
-- **skip-branch**: optional paths (e.g. non-web browser QA)
+- **fail-run:** mark attempt failed → run failed → cancel in-flight Parallel siblings
+- **retry:** use `retry` config; then fall through to fail-run or gate if still failing
+- **gate:** open HumanGate `error` with `retry` | `skip` | `abort`
+- **skip-branch:** mark attempt `skipped`; Branch/Parallel treats as the skip path where configured
 
 ### Parallel failure (locked)
 
-One worker fails → **cancel siblings + fail the run**. “Continue with partials” is not v1 default (optional later).
+One worker fails → cancel siblings + fail the run.
 
 ### Must-handle edge cases
 
-- Server restart mid-run: resume from last committed node state; in-flight turns use existing orchestration recovery; open gates stay open
-- Provider/model unavailable: clear failure → retry or gate; **no silent model fallback**
-- Client auth/pairing lost: run continues on server; any paired device can resolve gates
-- Environment offline (remote): `waiting_environment`; UI shows blocked reason; resume on reconnect
-- Graph validation: missing Branch edges, Parallel without join, illegal cycles (except capped loop-backs), Parallel worktree collisions
-- Invalid Branch structured output (e.g. missing `needsContext`): HumanGate (clarify / force continue / abort), not silent continue
-- Loop re-entrancy: new node-attempt; context accumulates; prior outputs versioned
-- QA browser unavailable: skip-branch or gate; never fake evidence; PR must not claim tests passed
-- PR exists / push rejected: gate with retry / alternate / abort; avoid duplicate PRs
-- Double Run: idempotency / UI disable; separate runs only when explicitly started
-- Permission denied (write/PR): gate with grant path
-- HumanGate timeout: wait forever (default), remind, or fail-run
-- Cancel run: interrupt turns/delegates, close gates, mark cancelled (idempotent)
-- Concurrent gate resolve: first write wins; second gets conflict
+- Server restart mid-run: resume from last committed events; in-flight turns use existing orchestration recovery; open gates stay open
+- Provider/model unavailable: clear failure; no silent fallback
+- Client auth lost: run continues; any paired operate-scoped session can `resolveGate`
+- Environment offline: `waiting_environment`; resume on reconnect
+- Invalid structured output / predicate path: HumanGate (force/abort), not silent else
+- Loop re-entrancy: new attempt; context accumulates; prior outputs versioned under attempts
+- QA browser unavailable: `skip-branch` or `gate`; never fake evidence; PR prompt must only cite recorded artifacts
+- PR exists / push rejected: Agent failure → node `onError` (recommend `gate`)
+- Double Run: `idempotencyKey` on start; UI disables while a non-terminal run exists for that key
+- Permission denied: prefer `onError: gate`
+- Cancel: idempotent interrupt + close gates
+- Concurrent gate resolve: first wins; second conflict
 
 ### Should-handle
 
-- Evidence size caps / thumbnails / compact PR evidence index
-- Gate field validation (non-empty / schema) at RPC before resume
+- Evidence size caps / thumbnails / compact evidence index
+- Gate field schema validation at RPC
 
-### Explicitly unsupported in v1
+### Unsupported in v1
 
-- User manually editing the repo while a run is live (document; agent checkpoints still apply per turn)
-- Mid-flight plan change without cancel + rerun
-- Cost runaway controls beyond basic validation (optional max concurrency can be added later)
+- Manual repo edits during a live run (document)
+- Mid-flight plan rewrite without cancel + new run
+- Parallel continue-with-partials
+- Run cost budgets (optional max concurrency may be added later)
 
 ## Testing
 
-- **WorkflowEngine:** table-driven advances for the hero graph; failure policies; loop cap; cancel idempotency; snapshot pin; recovery / `waiting_environment`
-- **Contracts:** graph validate; gate resolve validation and conflict
-- **Web:** `*.logic.test.ts` for projection → status mapping and command wiring; sparse browser tests for add node / connect edge / open inspector
-- **Integrated proof:** one real-client hero pass via `test-t3-app` after implementation
-- Engine tests use Replay/dev provider fixtures; do not require paid multi-provider CI runs
+- **WorkflowEngine:** table-driven hero graph; Branch true/false; loop cap; Parallel fail cancels siblings; Transform missing path; Wait manual + PR checks; cancel idempotency; snapshot pin; `waiting_environment`
+- **Contracts:** graph validate cases; resolveGate validation/conflict; optimistic workflow version
+- **Web:** `*.logic.test.ts` for projection mapping + commands; sparse browser tests for add node / connect edge / open inspector
+- **Integrated proof:** one `test-t3-app` hero pass after implementation
+- Engine tests use Replay/dev provider fixtures
 
 ## Extensibility (post-v1)
 
-- Automation nodes (triggers, HTTP, Slack, cron) register as additional node types + adapters
-- Parallel `continue-with-partials` policy
+- Automation nodes (triggers, HTTP, Slack, cron) + Wait schedule mode
+- Parallel `continue-with-partials`
 - Mobile canvas editing
-- Richer cost/budget caps
+- MCP tools for workflows
+- Richer Transform/Branch languages if path predicates prove insufficient
 
 ## Success criteria
 
@@ -219,4 +357,4 @@ v1 is done when a user can, in web/desktop:
 3. Watch nodes advance live on the canvas
 4. Answer a context HumanGate (including from mobile) and see Brainstorm re-run
 5. See parallel workers complete, QA evidence appear, and a PR open with evidence linked
-6. Observe correct failure behavior when a parallel worker fails (siblings cancelled, run failed)
+6. Observe correct failure when a parallel worker fails (siblings cancelled, run failed)
