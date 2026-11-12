@@ -243,7 +243,7 @@ Replace stub with real `WorkflowEngine.decide` in Chunk 3 without changing servi
 
 ### Task 7: Hero happy path + Wait
 
-**Files:** `WorkflowEngine.ts`, `BranchLogic.ts`, `TransformLogic.ts`, `ParallelLogic.ts`, `heroGraph.ts`, `WorkflowEngine.test.ts`
+**Files:** `WorkflowEngine.ts`, `BranchLogic.ts`, `TransformLogic.ts`, `ParallelLogic.ts`, `packages/contracts/src/workflowHeroGraph.ts`, `WorkflowEngine.test.ts`
 
 Import hero graph from `packages/contracts/src/workflowHeroGraph.ts` only (add in Task 7 if not present).
 
